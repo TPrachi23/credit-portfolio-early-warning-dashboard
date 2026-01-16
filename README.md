@@ -46,4 +46,34 @@ The design prioritizes **interpretability, auditability, and governance readines
 ---
 
 ## 📁 Repository Structure
+credit-portfolio-early-warning-dashboard/
+├── credit_portfolio_health_early_warning.sql
+└── README.md
+
+
+
+All analytics are intentionally contained in a **single SQL file** for clarity and ease of review.
+
+---
+
+## 🎯 Intended Use Cases
+
+- Credit risk portfolio monitoring
+- Early warning detection and proactive risk management
+- Risk committee and senior management reporting
+- Policy tuning and threshold calibration
+
+---
+
+## ⚠️ Disclaimer
+
+This project uses **synthetic data** and simplified assumptions for demonstration purposes only.  
+It does not represent any proprietary models, systems, or client data.
+
+---
+
+## 👤 Author
+
+**Prachi Thakur**  
+Credit Risk | Fraud & Compliance Analytics | Portfolio Monitoring
 
