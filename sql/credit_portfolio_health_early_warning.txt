@@ -1,0 +1,537 @@
+
+/* =========================
+   0) PARAMETERS (EDIT HERE)
+   ========================= */
+-- Set the month you want to report as-of (month start).
+-- Example: '2025-12-01' for December 2025 month.
+-- In tools that support variables, replace with a variable.
+WITH params AS (
+  SELECT DATE '2025-12-01' AS asof_month
+)
+SELECT * FROM params;
+-- End params preview
+
+
+/* ======================
+   1) SCHEMA (MINIMAL)
+   ====================== */
+
+-- 1.1 Customer / Account master
+CREATE TABLE IF NOT EXISTS dim_account (
+  account_id            VARCHAR(50) PRIMARY KEY,
+  customer_id           VARCHAR(50) NOT NULL,
+  open_date             DATE NOT NULL,
+  product_type          VARCHAR(50) NOT NULL,  -- e.g., CARD, BNPL, LOC
+  geography             VARCHAR(50) NULL,      -- e.g., US-TX
+  credit_limit          NUMERIC(18,2) NULL
+);
+
+-- 1.2 Monthly credit snapshot (one row per account per month)
+-- dpd = days past due measured at month end (or your standard)
+CREATE TABLE IF NOT EXISTS fact_credit_snapshot_m (
+  snapshot_month        DATE NOT NULL,         -- month start date (YYYY-MM-01)
+  account_id            VARCHAR(50) NOT NULL REFERENCES dim_account(account_id),
+  statement_balance     NUMERIC(18,2) NOT NULL DEFAULT 0,
+  principal_balance     NUMERIC(18,2) NOT NULL DEFAULT 0,
+  utilization_pct       NUMERIC(9,4)  NULL,    -- 0..1 or 0..100, be consistent
+  dpd                   INT NOT NULL DEFAULT 0,
+  risk_tier             VARCHAR(10) NOT NULL,  -- LOW / MED / HIGH
+  disputes_30d          INT NOT NULL DEFAULT 0,
+  exceptions_30d        INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (snapshot_month, account_id)
+);
+
+-- 1.3 Payments (optional if you want payment behavior EWIs)
+CREATE TABLE IF NOT EXISTS fact_payment (
+  payment_id            BIGSERIAL PRIMARY KEY,
+  account_id            VARCHAR(50) NOT NULL REFERENCES dim_account(account_id),
+  payment_date          DATE NOT NULL,
+  payment_amount        NUMERIC(18,2) NOT NULL
+);
+
+-- Helpful indexes
+CREATE INDEX IF NOT EXISTS idx_snap_account_month ON fact_credit_snapshot_m(account_id, snapshot_month);
+CREATE INDEX IF NOT EXISTS idx_pay_account_date ON fact_payment(account_id, payment_date);
+
+
+/* =========================================
+   2) STANDARD BUCKETS & RISK NORMALIZATION
+   ========================================= */
+
+-- DPD bucket mapping used across all outputs
+-- Bucket order is important for roll-rates.
+WITH dpd_bucket_map AS (
+  SELECT 0   AS min_dpd, 0   AS max_dpd, 'CURRENT' AS dpd_bucket, 1 AS bucket_order UNION ALL
+  SELECT 1,  29, '1-29',  2 UNION ALL
+  SELECT 30, 59, '30-59', 3 UNION ALL
+  SELECT 60, 89, '60-89', 4 UNION ALL
+  SELECT 90, 9999,'90+',  5
+)
+SELECT * FROM dpd_bucket_map;
+
+
+/* ======================================
+   3) BASE SNAPSHOT (AS-OF + PRIOR MONTH)
+   ====================================== */
+
+-- This CTE standardizes the current month + prior month snapshots
+WITH
+params AS (SELECT DATE '2025-12-01' AS asof_month),
+months AS (
+  SELECT
+    asof_month,
+    (asof_month - INTERVAL '1 month')::date AS prev_month
+  FROM params
+),
+dpd_bucket_map AS (
+  SELECT 0   AS min_dpd, 0   AS max_dpd, 'CURRENT' AS dpd_bucket, 1 AS bucket_order UNION ALL
+  SELECT 1,  29, '1-29',  2 UNION ALL
+  SELECT 30, 59, '30-59', 3 UNION ALL
+  SELECT 60, 89, '60-89', 4 UNION ALL
+  SELECT 90, 9999,'90+',  5
+),
+snap_two_months AS (
+  SELECT
+    s.snapshot_month,
+    s.account_id,
+    a.customer_id,
+    a.product_type,
+    a.geography,
+    s.statement_balance,
+    s.principal_balance,
+    s.utilization_pct,
+    s.dpd,
+    UPPER(s.risk_tier) AS risk_tier,
+    s.disputes_30d,
+    s.exceptions_30d
+  FROM fact_credit_snapshot_m s
+  JOIN dim_account a
+    ON a.account_id = s.account_id
+  JOIN months m
+    ON s.snapshot_month IN (m.asof_month, m.prev_month)
+),
+snap_bucketed AS (
+  SELECT
+    s.*,
+    b.dpd_bucket,
+    b.bucket_order
+  FROM snap_two_months s
+  JOIN dpd_bucket_map b
+    ON s.dpd BETWEEN b.min_dpd AND b.max_dpd
+)
+SELECT * FROM snap_bucketed
+LIMIT 50;
+
+
+/* ============================================================
+   4) OUTPUT A: DELINQUENCY DISTRIBUTION & TREND (BY MONTH)
+   ============================================================ */
+
+-- Produces distribution across DPD buckets + basic delinquency rates
+-- Extend months range as needed for time series (here: last 12 months example).
+WITH
+params AS (SELECT DATE '2025-12-01' AS asof_month),
+dpd_bucket_map AS (
+  SELECT 0   AS min_dpd, 0   AS max_dpd, 'CURRENT' AS dpd_bucket, 1 AS bucket_order UNION ALL
+  SELECT 1,  29, '1-29',  2 UNION ALL
+  SELECT 30, 59, '30-59', 3 UNION ALL
+  SELECT 60, 89, '60-89', 4 UNION ALL
+  SELECT 90, 9999,'90+',  5
+),
+month_range AS (
+  SELECT generate_series(
+           (SELECT asof_month - INTERVAL '11 months' FROM params),
+           (SELECT asof_month FROM params),
+           INTERVAL '1 month'
+         )::date AS snapshot_month
+),
+snap AS (
+  SELECT
+    s.snapshot_month,
+    s.account_id,
+    s.statement_balance,
+    s.principal_balance,
+    s.dpd
+  FROM fact_credit_snapshot_m s
+  JOIN month_range mr
+    ON mr.snapshot_month = s.snapshot_month
+),
+snap_bucketed AS (
+  SELECT
+    s.snapshot_month,
+    s.account_id,
+    s.statement_balance,
+    s.principal_balance,
+    s.dpd,
+    b.dpd_bucket,
+    b.bucket_order
+  FROM snap s
+  JOIN dpd_bucket_map b
+    ON s.dpd BETWEEN b.min_dpd AND b.max_dpd
+),
+agg AS (
+  SELECT
+    snapshot_month,
+    dpd_bucket,
+    bucket_order,
+    COUNT(*) AS accounts,
+    SUM(statement_balance) AS stmt_bal,
+    SUM(principal_balance) AS prin_bal
+  FROM snap_bucketed
+  GROUP BY 1,2,3
+),
+tot AS (
+  SELECT
+    snapshot_month,
+    SUM(accounts) AS total_accounts,
+    SUM(stmt_bal) AS total_stmt_bal,
+    SUM(prin_bal) AS total_prin_bal
+  FROM agg
+  GROUP BY 1
+)
+SELECT
+  a.snapshot_month,
+  a.dpd_bucket,
+  a.accounts,
+  a.stmt_bal,
+  a.prin_bal,
+  t.total_accounts,
+  ROUND(a.accounts::numeric / NULLIF(t.total_accounts,0), 6) AS pct_accounts,
+  ROUND(a.stmt_bal::numeric / NULLIF(t.total_stmt_bal,0), 6) AS pct_stmt_bal,
+  -- headline delinquency flags
+  CASE WHEN a.dpd_bucket IN ('30-59','60-89','90+') THEN 1 ELSE 0 END AS is_30_plus_bucket,
+  CASE WHEN a.dpd_bucket IN ('60-89','90+') THEN 1 ELSE 0 END AS is_60_plus_bucket,
+  CASE WHEN a.dpd_bucket IN ('90+') THEN 1 ELSE 0 END AS is_90_plus_bucket
+FROM agg a
+JOIN tot t USING (snapshot_month)
+ORDER BY a.snapshot_month, a.bucket_order;
+
+
+/* ============================================================
+   5) OUTPUT B: ROLL-RATE MATRIX (PREV MONTH -> AS-OF MONTH)
+   ============================================================ */
+
+-- Roll-rates show migration across delinquency buckets month-over-month.
+WITH
+params AS (SELECT DATE '2025-12-01' AS asof_month),
+months AS (
+  SELECT asof_month, (asof_month - INTERVAL '1 month')::date AS prev_month FROM params
+),
+dpd_bucket_map AS (
+  SELECT 0   AS min_dpd, 0   AS max_dpd, 'CURRENT' AS dpd_bucket, 1 AS bucket_order UNION ALL
+  SELECT 1,  29, '1-29',  2 UNION ALL
+  SELECT 30, 59, '30-59', 3 UNION ALL
+  SELECT 60, 89, '60-89', 4 UNION ALL
+  SELECT 90, 9999,'90+',  5
+),
+snap_prev AS (
+  SELECT
+    s.account_id,
+    s.statement_balance AS prev_stmt_bal,
+    s.dpd AS prev_dpd
+  FROM fact_credit_snapshot_m s
+  JOIN months m ON s.snapshot_month = m.prev_month
+),
+snap_curr AS (
+  SELECT
+    s.account_id,
+    s.statement_balance AS curr_stmt_bal,
+    s.dpd AS curr_dpd
+  FROM fact_credit_snapshot_m s
+  JOIN months m ON s.snapshot_month = m.asof_month
+),
+joined AS (
+  SELECT
+    COALESCE(c.account_id, p.account_id) AS account_id,
+    p.prev_stmt_bal,
+    p.prev_dpd,
+    c.curr_stmt_bal,
+    c.curr_dpd
+  FROM snap_curr c
+  FULL JOIN snap_prev p
+    ON p.account_id = c.account_id
+),
+bucketed AS (
+  SELECT
+    j.*,
+    bp.dpd_bucket AS prev_bucket,
+    bp.bucket_order AS prev_order,
+    bc.dpd_bucket AS curr_bucket,
+    bc.bucket_order AS curr_order
+  FROM joined j
+  LEFT JOIN dpd_bucket_map bp ON j.prev_dpd BETWEEN bp.min_dpd AND bp.max_dpd
+  LEFT JOIN dpd_bucket_map bc ON j.curr_dpd BETWEEN bc.min_dpd AND bc.max_dpd
+),
+matrix AS (
+  SELECT
+    prev_bucket,
+    curr_bucket,
+    COUNT(*) AS accounts,
+    SUM(COALESCE(curr_stmt_bal,0)) AS curr_stmt_bal
+  FROM bucketed
+  GROUP BY 1,2
+),
+row_totals AS (
+  SELECT
+    prev_bucket,
+    SUM(accounts) AS prev_bucket_accounts
+  FROM matrix
+  GROUP BY 1
+)
+SELECT
+  m.prev_bucket,
+  m.curr_bucket,
+  m.accounts,
+  m.curr_stmt_bal,
+  ROUND(m.accounts::numeric / NULLIF(r.prev_bucket_accounts,0), 6) AS roll_rate
+FROM matrix m
+JOIN row_totals r USING (prev_bucket)
+ORDER BY
+  CASE m.prev_bucket
+    WHEN 'CURRENT' THEN 1 WHEN '1-29' THEN 2 WHEN '30-59' THEN 3 WHEN '60-89' THEN 4 ELSE 5 END,
+  CASE m.curr_bucket
+    WHEN 'CURRENT' THEN 1 WHEN '1-29' THEN 2 WHEN '30-59' THEN 3 WHEN '60-89' THEN 4 ELSE 5 END;
+
+
+/* ==================================================
+   6) OUTPUT C: RISK TIER MIGRATION (PREV -> CURRENT)
+   ================================================== */
+
+WITH
+params AS (SELECT DATE '2025-12-01' AS asof_month),
+months AS (
+  SELECT asof_month, (asof_month - INTERVAL '1 month')::date AS prev_month FROM params
+),
+prev AS (
+  SELECT account_id, UPPER(risk_tier) AS prev_risk_tier
+  FROM fact_credit_snapshot_m
+  JOIN months ON snapshot_month = prev_month
+),
+curr AS (
+  SELECT account_id, UPPER(risk_tier) AS curr_risk_tier
+  FROM fact_credit_snapshot_m
+  JOIN months ON snapshot_month = asof_month
+),
+joined AS (
+  SELECT
+    COALESCE(c.account_id, p.account_id) AS account_id,
+    p.prev_risk_tier,
+    c.curr_risk_tier
+  FROM curr c
+  FULL JOIN prev p USING (account_id)
+),
+matrix AS (
+  SELECT
+    prev_risk_tier,
+    curr_risk_tier,
+    COUNT(*) AS accounts
+  FROM joined
+  GROUP BY 1,2
+),
+row_totals AS (
+  SELECT prev_risk_tier, SUM(accounts) AS prev_tier_accounts
+  FROM matrix
+  GROUP BY 1
+)
+SELECT
+  m.prev_risk_tier,
+  m.curr_risk_tier,
+  m.accounts,
+  ROUND(m.accounts::numeric / NULLIF(r.prev_tier_accounts,0), 6) AS migration_rate
+FROM matrix m
+JOIN row_totals r USING (prev_risk_tier)
+ORDER BY
+  CASE m.prev_risk_tier WHEN 'LOW' THEN 1 WHEN 'MED' THEN 2 WHEN 'HIGH' THEN 3 ELSE 9 END,
+  CASE m.curr_risk_tier WHEN 'LOW' THEN 1 WHEN 'MED' THEN 2 WHEN 'HIGH' THEN 3 ELSE 9 END;
+
+
+/* ==========================================================
+   7) OUTPUT D: EARLY WARNING INDICATORS (EWI) - ACCOUNT LEVEL
+   ==========================================================
+
+EWIs (examples you can keep / tweak):
+- EWI_1: Utilization jump (>= +0.15) vs prior month
+- EWI_2: Balance growth (>= +20%) vs prior month
+- EWI_3: Still "CURRENT" but has repeated payment delay proxy:
+         dpd in 1-29 for 2 of last 3 months (requires 3 months)
+- EWI_4: Disputes/Exceptions spike (>= 3 in 30d)
+
+Output: account-level flags to feed your dashboard / case queue.
+
+========================================================== */
+
+WITH
+params AS (SELECT DATE '2025-12-01' AS asof_month),
+m AS (
+  SELECT
+    asof_month,
+    (asof_month - INTERVAL '1 month')::date AS prev_month,
+    (asof_month - INTERVAL '2 months')::date AS prev2_month
+  FROM params
+),
+curr AS (
+  SELECT
+    s.account_id,
+    s.statement_balance AS curr_stmt_bal,
+    s.utilization_pct   AS curr_util,
+    s.dpd               AS curr_dpd,
+    UPPER(s.risk_tier)  AS curr_risk_tier,
+    s.disputes_30d      AS curr_disputes_30d,
+    s.exceptions_30d    AS curr_exceptions_30d
+  FROM fact_credit_snapshot_m s
+  JOIN m ON s.snapshot_month = m.asof_month
+),
+prev AS (
+  SELECT
+    s.account_id,
+    s.statement_balance AS prev_stmt_bal,
+    s.utilization_pct   AS prev_util,
+    s.dpd               AS prev_dpd,
+    UPPER(s.risk_tier)  AS prev_risk_tier
+  FROM fact_credit_snapshot_m s
+  JOIN m ON s.snapshot_month = m.prev_month
+),
+prev2 AS (
+  SELECT
+    s.account_id,
+    s.dpd AS prev2_dpd
+  FROM fact_credit_snapshot_m s
+  JOIN m ON s.snapshot_month = m.prev2_month
+),
+joined AS (
+  SELECT
+    c.account_id,
+    c.curr_stmt_bal, p.prev_stmt_bal,
+    c.curr_util,     p.prev_util,
+    c.curr_dpd,      p.prev_dpd,
+    pv2.prev2_dpd,
+    c.curr_risk_tier, p.prev_risk_tier,
+    c.curr_disputes_30d,
+    c.curr_exceptions_30d
+  FROM curr c
+  LEFT JOIN prev p   USING (account_id)
+  LEFT JOIN prev2 pv2 USING (account_id)
+),
+calc AS (
+  SELECT
+    j.*,
+    -- guards against divide-by-zero / nulls
+    (j.curr_util - COALESCE(j.prev_util, j.curr_util)) AS util_delta,
+    CASE
+      WHEN COALESCE(j.prev_stmt_bal,0) = 0 THEN NULL
+      ELSE (j.curr_stmt_bal - j.prev_stmt_bal) / NULLIF(j.prev_stmt_bal,0)
+    END AS stmt_bal_growth_pct,
+
+    -- EWI_3: dpd in 1-29 in 2 of last 3 months (proxy for repeated delays)
+    (
+      (CASE WHEN j.curr_dpd BETWEEN 1 AND 29 THEN 1 ELSE 0 END) +
+      (CASE WHEN j.prev_dpd BETWEEN 1 AND 29 THEN 1 ELSE 0 END) +
+      (CASE WHEN j.prev2_dpd BETWEEN 1 AND 29 THEN 1 ELSE 0 END)
+    ) AS cnt_dpd_1_29_last3
+  FROM joined j
+),
+flags AS (
+  SELECT
+    account_id,
+    curr_risk_tier,
+    curr_dpd,
+    curr_stmt_bal,
+    curr_util,
+    util_delta,
+    stmt_bal_growth_pct,
+    curr_disputes_30d,
+    curr_exceptions_30d,
+
+    -- EWI flags
+    CASE WHEN util_delta >= 0.15 THEN 1 ELSE 0 END AS ewi_util_jump,
+    CASE WHEN stmt_bal_growth_pct IS NOT NULL AND stmt_bal_growth_pct >= 0.20 THEN 1 ELSE 0 END AS ewi_balance_growth,
+    CASE WHEN curr_dpd = 0 AND cnt_dpd_1_29_last3 >= 2 THEN 1 ELSE 0 END AS ewi_repeat_minor_delinquency,
+    CASE WHEN (curr_disputes_30d + curr_exceptions_30d) >= 3 THEN 1 ELSE 0 END AS ewi_dispute_exception_spike
+  FROM calc
+),
+scored AS (
+  SELECT
+    *,
+    (ewi_util_jump + ewi_balance_growth + ewi_repeat_minor_delinquency + ewi_dispute_exception_spike) AS ewi_flag_count,
+    CASE
+      WHEN (ewi_util_jump + ewi_balance_growth + ewi_repeat_minor_delinquency + ewi_dispute_exception_spike) >= 2 THEN 'HIGH'
+      WHEN (ewi_util_jump + ewi_balance_growth + ewi_repeat_minor_delinquency + ewi_dispute_exception_spike) = 1 THEN 'MED'
+      ELSE 'LOW'
+    END AS ewi_severity
+  FROM flags
+)
+SELECT *
+FROM scored
+ORDER BY ewi_flag_count DESC, curr_risk_tier, curr_dpd DESC, curr_stmt_bal DESC;
+
+
+/* ==========================================================
+   8) OUTPUT E: PORTFOLIO-LEVEL EXEC SUMMARY (AS-OF MONTH)
+   ========================================================== */
+
+WITH
+params AS (SELECT DATE '2025-12-01' AS asof_month),
+snap AS (
+  SELECT
+    s.account_id,
+    UPPER(s.risk_tier) AS risk_tier,
+    s.dpd,
+    s.statement_balance
+  FROM fact_credit_snapshot_m s
+  JOIN params p ON s.snapshot_month = p.asof_month
+),
+agg AS (
+  SELECT
+    risk_tier,
+    COUNT(*) AS accounts,
+    SUM(statement_balance) AS stmt_bal,
+    SUM(CASE WHEN dpd >= 30 THEN 1 ELSE 0 END) AS accts_30p,
+    SUM(CASE WHEN dpd >= 60 THEN 1 ELSE 0 END) AS accts_60p,
+    SUM(CASE WHEN dpd >= 90 THEN 1 ELSE 0 END) AS accts_90p,
+    SUM(CASE WHEN dpd >= 30 THEN statement_balance ELSE 0 END) AS bal_30p,
+    SUM(CASE WHEN dpd >= 60 THEN statement_balance ELSE 0 END) AS bal_60p,
+    SUM(CASE WHEN dpd >= 90 THEN statement_balance ELSE 0 END) AS bal_90p
+  FROM snap
+  GROUP BY 1
+),
+tot AS (
+  SELECT
+    SUM(accounts) AS total_accounts,
+    SUM(stmt_bal) AS total_stmt_bal
+  FROM agg
+)
+SELECT
+  a.risk_tier,
+  a.accounts,
+  a.stmt_bal,
+  ROUND(a.accounts::numeric / NULLIF(t.total_accounts,0), 6) AS pct_accounts,
+  ROUND(a.stmt_bal::numeric / NULLIF(t.total_stmt_bal,0), 6) AS pct_stmt_bal,
+
+  -- delinquency rates (account-based)
+  ROUND(a.accts_30p::numeric / NULLIF(a.accounts,0), 6) AS dq_30p_rate,
+  ROUND(a.accts_60p::numeric / NULLIF(a.accounts,0), 6) AS dq_60p_rate,
+  ROUND(a.accts_90p::numeric / NULLIF(a.accounts,0), 6) AS dq_90p_rate,
+
+  -- delinquency rates (balance-based)
+  ROUND(a.bal_30p::numeric / NULLIF(a.stmt_bal,0), 6) AS dq_30p_bal_rate,
+  ROUND(a.bal_60p::numeric / NULLIF(a.stmt_bal,0), 6) AS dq_60p_bal_rate,
+  ROUND(a.bal_90p::numeric / NULLIF(a.stmt_bal,0), 6) AS dq_90p_bal_rate
+FROM agg a
+CROSS JOIN tot t
+ORDER BY CASE a.risk_tier WHEN 'LOW' THEN 1 WHEN 'MED' THEN 2 WHEN 'HIGH' THEN 3 ELSE 9 END;
+
+
+/* ==========================================================
+   9) OPTIONAL: “DASHBOARD TABLES” AS VIEWS (UNCOMMENT IF WANTED)
+   ==========================================================
+
+-- If you want persistent objects for BI tools, create views:
+-- CREATE OR REPLACE VIEW vw_portfolio_delinquency_trend AS ( ...Output A query... );
+-- CREATE OR REPLACE VIEW vw_roll_rate_matrix AS ( ...Output B query... );
+-- CREATE OR REPLACE VIEW vw_risk_tier_migration AS ( ...Output C query... );
+-- CREATE OR REPLACE VIEW vw_ewi_account_flags AS ( ...Output D query... );
+-- CREATE OR REPLACE VIEW vw_portfolio_exec_summary AS ( ...Output E query... );
+
+========================================================== */
+
+-- End of file
